@@ -44,9 +44,10 @@ SLOW_CAR_MEAN = np.array(
     dtype=float)
 
 # 求解参数
-BIG_M = 3e3
+BIG_M = 1e3                         # KKT互补松弛线性化Big-M
 THROUGHPUT_COST = 0.01              # 储能吞吐成本(元/kWh)
 FAIRNESS_CS_PENALTY = 1e-3          # 公平性偏差惩罚系数
+KKT_DUAL_UB = 1e4                   # 对偶变量上界
 
 
 # ════════════════════════════════════════════════════════════════

@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-终极版双层模型 — 主入口
-面向快充服务场景的、考虑电热耦合与不确定性的、VPP—储能型充电站双层协调优化模型
+真正双层模型（KKT嵌入版） — 主入口
+VPP—储能型充电站双层协调优化模型
 
-功能：
-  1. 加载数据、生成需求
-  2. 市场准入评估
-  3. 冬/夏季节循环求解
-  4. 结果导出（Excel + 绘图）
+核心改进：
+  - 下层充电站有独立目标（利润最大化）
+  - 下层最优响应通过KKT条件嵌入上层
+  - 上层仅决定激励价格(π)、分配量、市场申报
+  - 慢充取期望值实现确定性化（下层为连续LP）
 """
 import os
 import numpy as np
@@ -16,14 +16,14 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from vpp_cs_bilevel_base import (
+from model.vpp_cs_bilevel_base import (
     N, DT, HOURS, BASE_DIR, N_STATIONS,
     StationParam, MarketParam, ThermalParam,
     load_price_data, daily_temp_curve, kappa_winter, kappa_summer,
     build_station_data, assess_eligibility, build_dr_mask,
     setup_plot_style,
 )
-from vpp_cs_bilevel_upper import solve_bilevel
+from model.vpp_cs_bilevel_upper import solve_bilevel
 
 
 # ════════════════════════════════════════════════════════════════
@@ -58,7 +58,7 @@ def run_season(season, price_mwh, kappa, temp, alpha, beta,
     dr_mask = build_dr_mask(price_mwh, mp.dr_top_k)
     baseline = no_bess_baseline(price_mwh, station_fast, station_slow,
                                 station_slow_probs, kappa, alpha, stations, mp)
-    print(f"  双层协调优化 MIQCP 求解...")
+    print(f"  真正双层KKT嵌入 MIQCP 求解...")
     best = solve_bilevel(
         price_mwh, kappa, temp, alpha, beta,
         stations, station_fast, station_slow, station_slow_probs,

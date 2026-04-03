@@ -1,74 +1,76 @@
 # -*- coding: utf-8 -*-
 """
-终极版双层模型 — 上层VPP模型 + 双层协调求解
-面向快充服务场景的、考虑电热耦合与不确定性的、VPP—储能型充电站双层协调优化模型
+真正双层模型 — 上层VPP模型 + KKT嵌入求解
 
-上层决策：
-  - 日前市场申报策略（合约/现货/辅助服务）
-  - 激励价格 π_contract[t], π_spot[t], π_reserve[t]
-  - 各站灵活性购买量（分配）
+上层决策变量（VPP聚合商）：
+  - 激励价格 π_c[t], π_s[t], π_r[t]
+  - 各站分配量 alloc_c[i][t], alloc_s[i][t], alloc_r[i][t]
+  - 市场申报策略 contract_ratio, spot_ratio, reserve_kw
 
-双层协调机制：
-  - 下层充电站通过 KKT 条件嵌入上层
-  - IR 约束（站端利润≥0）用 Gurobi 二次约束精确表示
-  - 上层目标中 π×g 双线性项直接用 Gurobi 二次目标
+上层目标：max VPP利润 = 市场收入 - 激励成本
+  即 min -(市场收入) + 激励成本
+
+下层变量通过KKT最优性条件锁定为最优响应，而非上层直接优化。
 
 求解器：Gurobi MIQCP (NonConvex=2)
+  - 驻点条件中 π*DT 项与对偶变量的交互产生双线性
+  - 上层目标中 π*g 产生双线性
 """
 import numpy as np
 import gurobipy as gp
 from gurobipy import GRB
 
-from vpp_cs_bilevel_base import (
+from model.vpp_cs_bilevel_base import (
     N, DT, HOURS, BIG_M, THROUGHPUT_COST, FAIRNESS_CS_PENALTY,
     power_factor_from_temp,
 )
-from vpp_cs_bilevel_lower import build_station_model
+from model.vpp_cs_bilevel_lower import build_lower_kkt
 
 
 def solve_bilevel(price_mwh, kappa, temp, alpha, beta,
                   stations, station_fast, station_slow, station_slow_probs,
                   eligibility, mp, tp, dr_mask, n_st=None):
-    """
-    构建并求解 VPP-充电站双层协调优化模型。
-
-    返回完整结果字典，或 None（无可行解）。
-    """
+    """构建并求解真正的双层协调优化模型（KKT嵌入）。"""
     if n_st is None:
         n_st = len(stations)
 
     # ── 市场价格信号 ──
     P_rel = float(eligibility["P_reliable_kW"])
-    sell_p = np.maximum(price_mwh - mp.spot_discount, 0) / 1000  # 元/kWh
+    sell_p = np.maximum(price_mwh - mp.spot_discount, 0) / 1000
     buy_p = price_mwh / 1000
     high_mask = (price_mwh >= np.percentile(price_mwh, 75)).astype(float)
-    low_mask = (price_mwh <= np.percentile(price_mwh, 100 * tp.low_price_quantile)).astype(float)
-    heat_value_signal = np.maximum(np.max(buy_p) - buy_p, 0.0)
 
-    # 市场单位价格 (元/kWh) — π 的上界
     cup = np.full(N, mp.contract_price / 1000.0)
     sup = sell_p.copy()
     rup = np.full(N, mp.as_price / 1000.0 * mp.reliability)
 
     # ── 市场可用功率 ──
-    tpf = power_factor_from_temp(temp, ref_c=tp.temp_power_ref_c,
-                                 slope_per_c=tp.temp_power_slope_per_c,
-                                 floor=tp.temp_power_floor)
+    tpf = power_factor_from_temp(temp, tp.temp_power_ref_c,
+                                 tp.temp_power_slope_per_c, tp.temp_power_floor)
     agg_fast = station_fast[:n_st].sum(axis=0)
-    tqr = np.zeros_like(temp)
     Prel_prof = np.minimum(P_rel, tpf * P_rel)
     tmu = tp.heat_market_release_ratio * np.minimum(
         alpha * kappa * agg_fast, tp.market_uplift_cap_kw)
-    Pmkt = np.maximum(Prel_prof - tqr + tmu, 0.0)
+    Pmkt = np.maximum(Prel_prof + tmu, 0.0)
+
+    # ── 慢充期望需求（确定性化） ──
+    slow_expected = []
+    for i in range(n_st):
+        probs = station_slow_probs[i]
+        probs = probs / probs.sum()
+        exp_slow = np.tensordot(probs, station_slow[i], axes=(0, 0))
+        slow_expected.append(exp_slow)
 
     # ═══════════════════════════════════════════
     # Gurobi 模型
     # ═══════════════════════════════════════════
-    mdl = gp.Model("VPP_CS_Bilevel")
+    mdl = gp.Model("VPP_CS_Bilevel_KKT")
     mdl.Params.OutputFlag = 1
-    mdl.Params.TimeLimit = 600
-    mdl.Params.MIPGap = 0.02
-    mdl.Params.NonConvex = 2  # 允许非凸二次
+    mdl.Params.TimeLimit = 1200
+    mdl.Params.MIPGap = 0.03
+    mdl.Params.NonConvex = 2
+    mdl.Params.MIPFocus = 1
+    mdl.Params.Threads = 0
 
     # ═══════════════════════════════════════════
     # 上层变量：VPP市场策略
@@ -88,15 +90,15 @@ def solve_bilevel(price_mwh, kappa, temp, alpha, beta,
         reserve_on.ub = 0
 
     # 市场申报曲线
-    cc = mdl.addVars(N, lb=0, name="cc")  # 合约申报
-    so = mdl.addVars(N, lb=0, name="so")  # 现货申报
-    rt = mdl.addVars(N, lb=0, name="rt")  # 备用申报
+    cc = mdl.addVars(N, lb=0, name="cc")
+    so = mdl.addVars(N, lb=0, name="so")
+    rt = mdl.addVars(N, lb=0, name="rt")
     for t in range(N):
         cc[t].ub = float(Pmkt[t])
         so[t].ub = float(Pmkt[t])
         rt[t].ub = float(Pmkt[t])
 
-    # 激励价格
+    # 激励价格（上层核心决策变量）
     pi_c = mdl.addVars(N, lb=0, name="pi_c")
     pi_s = mdl.addVars(N, lb=0, name="pi_s")
     pi_r = mdl.addVars(N, lb=0, name="pi_r")
@@ -105,7 +107,7 @@ def solve_bilevel(price_mwh, kappa, temp, alpha, beta,
         pi_s[t].ub = float(sup[t])
         pi_r[t].ub = float(rup[t])
 
-    # 分配变量：VPP分配给各站的灵活性购买量
+    # 分配变量（上层核心决策变量）
     alloc_c = [[mdl.addVar(lb=0, ub=float(Pmkt[t]), name=f"ac_{i}_{t}")
                 for t in range(N)] for i in range(n_st)]
     alloc_s = [[mdl.addVar(lb=0, ub=float(Pmkt[t]), name=f"as_{i}_{t}")
@@ -113,19 +115,17 @@ def solve_bilevel(price_mwh, kappa, temp, alpha, beta,
     alloc_r = [[mdl.addVar(lb=0, ub=float(Pmkt[t]), name=f"ar_{i}_{t}")
                 for t in range(N)] for i in range(n_st)]
 
-    # 公平性辅助变量
-    avg_cs = mdl.addVar(lb=0, name="avg_cs")
-    cs_dev = mdl.addVars(n_st, lb=0, name="csdev")
-
     # ═══════════════════════════════════════════
-    # 下层：各站模型
+    # 下层：各站KKT嵌入
     # ═══════════════════════════════════════════
     st_models = []
     for i in range(n_st):
-        sm = build_station_model(
+        sm = build_lower_kkt(
             mdl, stations[i], price_mwh, station_fast[i],
-            station_slow[i], station_slow_probs[i],
-            kappa, temp, alpha, beta, mp, tp, station_idx=i)
+            slow_expected[i], kappa, temp, alpha, beta, mp, tp,
+            pi_c, pi_s, pi_r,
+            alloc_c[i], alloc_s[i], alloc_r[i],
+            station_idx=i)
         st_models.append(sm)
 
     mdl.update()
@@ -134,10 +134,8 @@ def solve_bilevel(price_mwh, kappa, temp, alpha, beta,
     # 上层约束：市场申报
     # ═══════════════════════════════════════════
     for t in range(N):
-        # 合约申报 = ratio × Pmkt × mask
         mdl.addConstr(cc[t] == contract_ratio * float(Pmkt[t] * mp.contract_mask[t]),
                       name=f"cc_def_{t}")
-        # 备用申报 = reserve_kw × mask
         mdl.addConstr(rt[t] == reserve_kw * float(mp.reserve_mask[t]),
                       name=f"rt_def_{t}")
         # 分配求和 = 总申报
@@ -160,103 +158,41 @@ def solve_bilevel(price_mwh, kappa, temp, alpha, beta,
     mdl.addConstr(reserve_kw >= mp.as_min_kw * reserve_on, name="rk_min")
 
     # ═══════════════════════════════════════════
-    # 双层耦合：分配 → 下层交付约束
-    # ═══════════════════════════════════════════
-    for i in range(n_st):
-        sm = st_models[i]
-        for t in range(N):
-            # 修改下层交付约束的RHS为分配量
-            # g_contract[t] + cs[t] == alloc_c[i][t]
-            # 由于 Gurobi 不支持直接修改RHS为变量，
-            # 我们删除原约束并重建
-            mdl.remove(sm["constr_contract"][t])
-            mdl.remove(sm["constr_spot"][t])
-            mdl.remove(sm["constr_reserve"][t])
-
-            mdl.addConstr(sm["g_contract"][t] + sm["cs"][t] == alloc_c[i][t],
-                          name=f"s{i}_cdel_{t}")
-            mdl.addConstr(sm["g_spot"][t] + sm["ss"][t] == alloc_s[i][t],
-                          name=f"s{i}_sdel_{t}")
-            mdl.addConstr(sm["reserve"][t] + sm["rs"][t] == alloc_r[i][t],
-                          name=f"s{i}_rdel_{t}")
-
-    # 公平性约束
-    cs_sum = gp.LinExpr()
-    for i in range(n_st):
-        sm = st_models[i]
-        for t in range(N):
-            cs_sum += DT * sm["cs"][t]
-    mdl.addConstr(n_st * avg_cs == cs_sum, name="avg_cs_def")
-
-    for i in range(n_st):
-        sm = st_models[i]
-        cs_i = gp.quicksum(DT * sm["cs"][t] for t in range(N))
-        mdl.addConstr(cs_i - avg_cs <= cs_dev[i], name=f"csdev_pos_{i}")
-        mdl.addConstr(avg_cs - cs_i <= cs_dev[i], name=f"csdev_neg_{i}")
-
-    # ═══════════════════════════════════════════
-    # IR 约束：每个站端利润 ≥ 0（二次约束）
-    # station_profit = 充电收入 + 激励收入(π×g) - 购电成本 - 吞吐成本 - 热管理成本 - 偏差罚金
+    # IR约束（站端利润≥0，额外保障）
     # ═══════════════════════════════════════════
     for i in range(n_st):
         sm = st_models[i]
         profit = gp.QuadExpr()
-
-        # + 充电服务收入
         for t in range(N):
             profit += mp.fast_price * DT * sm["p_fast"][t]
-        for s in range(sm["n_scenarios"]):
-            pr = float(sm["scenario_probs"][s])
-            for t in range(N):
-                profit += pr * mp.slow_price * DT * sm["p_slow"][s][t]
-
-        # + 激励收入（二次项：π × g，精确表示）
-        for t in range(N):
+            profit += mp.slow_price * DT * sm["p_slow"][t]
             profit += DT * pi_c[t] * sm["g_contract"][t]
             profit += DT * pi_s[t] * sm["g_spot"][t]
             profit += DT * pi_r[t] * sm["reserve"][t]
-
-        # - 购电成本
-        for t in range(N):
             profit -= float(buy_p[t]) * DT * sm["g_buy"][t]
-
-        # - 储能吞吐成本
-        for t in range(N):
             profit -= THROUGHPUT_COST * DT * sm["ch"][t]
             profit -= THROUGHPUT_COST * DT * sm["dis"][t]
-
-        # - 热管理成本
-        for t in range(N):
             profit -= float(buy_p[t]) * DT * sm["h_elec"][t]
             profit -= float(buy_p[t]) * DT * sm["h_ch_grid"][t]
-
-        # - 偏差罚金
-        for t in range(N):
             profit -= mp.contract_penalty * DT * sm["cs"][t]
             profit -= mp.spot_penalty * DT * sm["ss"][t]
             profit -= mp.as_penalty * DT * sm["rs"][t]
-
         mdl.addQConstr(profit >= 0, name=f"IR_{i}")
 
     # ═══════════════════════════════════════════
-    # 目标函数（二次）
-    # VPP利润 = 市场收入 - 激励成本
-    # minimize: -(市场收入) + 激励成本 + 公平性惩罚
+    # 上层目标：min -(市场收入) + 激励成本
+    # VPP利润 = Σ(市场价×下层交付) - Σ(π×下层交付)
     # ═══════════════════════════════════════════
     obj = gp.QuadExpr()
-
-    # 公平性惩罚
-    for i in range(n_st):
-        obj += FAIRNESS_CS_PENALTY * cs_dev[i]
 
     for i in range(n_st):
         sm = st_models[i]
         for t in range(N):
-            # - 市场收入（VPP卖电收入）
+            # -市场收入 (VPP按市场价卖电)
             obj -= float(cup[t]) * DT * sm["g_contract"][t]
             obj -= float(sup[t]) * DT * sm["g_spot"][t]
             obj -= float(rup[t]) * DT * sm["reserve"][t]
-            # + 激励成本（VPP支付给充电站，二次项）
+            # +激励成本 (VPP支付给站, 双线性: π×g)
             obj += DT * pi_c[t] * sm["g_contract"][t]
             obj += DT * pi_s[t] * sm["g_spot"][t]
             obj += DT * pi_r[t] * sm["reserve"][t]
@@ -267,7 +203,7 @@ def solve_bilevel(price_mwh, kappa, temp, alpha, beta,
     # 求解
     # ═══════════════════════════════════════════
     mdl.update()
-    print(f"    双层MIQCP: {mdl.NumVars}vars / {mdl.NumBinVars}bin / "
+    print(f"    真正双层KKT嵌入: {mdl.NumVars}vars / {mdl.NumBinVars}bin / "
           f"{mdl.NumConstrs}constr / {mdl.NumQConstrs}qconstr")
 
     mdl.optimize()
@@ -290,39 +226,37 @@ def solve_bilevel(price_mwh, kappa, temp, alpha, beta,
     for i in range(n_st):
         sm = st_models[i]
 
-        def _v(var_dict, key=None):
-            if key is not None:
-                return np.array([var_dict[key][t].X for t in range(N)])
-            return np.array([var_dict[t].X for t in range(N)])
+        def _v(vd):
+            return np.array([vd[t].X for t in range(N)])
 
-        g_buy = _v(sm["g_buy"])
-        p_fast = _v(sm["p_fast"])
-        g_contract = _v(sm["g_contract"])
-        g_spot = _v(sm["g_spot"])
+        g_buy_v = _v(sm["g_buy"])
+        p_fast_v = _v(sm["p_fast"])
+        p_slow_v = _v(sm["p_slow"])
+        g_contract_v = _v(sm["g_contract"])
+        g_spot_v = _v(sm["g_spot"])
         reserve_v = _v(sm["reserve"])
-        ch_v = _v(sm["ch"]); dis_v = _v(sm["dis"])
-        e_v = _v(sm["e"]); h_v = _v(sm["h"])
+        ch_v = _v(sm["ch"])
+        dis_v = _v(sm["dis"])
+        e_v = _v(sm["e"])
+        h_v = _v(sm["h"])
         h_elec_v = _v(sm["h_elec"])
         h_ch_grid_v = _v(sm["h_ch_grid"])
         q_heat_v = _v(sm["q_heat"])
-        cs_v = _v(sm["cs"]); ss_v = _v(sm["ss"]); rs_v = _v(sm["rs"])
+        cs_v = _v(sm["cs"])
+        ss_v = _v(sm["ss"])
+        rs_v = _v(sm["rs"])
 
-        p_slow_sc = np.array([[sm["p_slow"][s][t].X for t in range(N)]
-                              for s in range(sm["n_scenarios"])])
-        sc_pr = sm["scenario_probs"]
-        p_slow_mean = np.tensordot(sc_pr, p_slow_sc, axes=(0, 0))
-
-        user_rev = float(mp.fast_price * np.sum(p_fast) * DT
-                         + mp.slow_price * np.sum(p_slow_mean) * DT)
-        buy_cost = float(np.sum(buy_p * g_buy * DT))
+        user_rev = float(mp.fast_price * np.sum(p_fast_v) * DT
+                         + mp.slow_price * np.sum(p_slow_v) * DT)
+        buy_cost = float(np.sum(buy_p * g_buy_v * DT))
         tc = float(np.sum((ch_v + dis_v) * THROUGHPUT_COST * DT))
         h_elec_cost = float(np.sum(buy_p * h_elec_v * DT))
         h_ch_grid_cost = float(np.sum(buy_p * h_ch_grid_v * DT))
         heat_offset = float(np.sum(q_heat_v * buy_p * DT
                                    / max(tp.heat_elec_eff, 1e-9)) * tp.heat_value_factor)
 
-        inc_c = float(np.sum(pic_val * g_contract * DT))
-        inc_s = float(np.sum(pis_val * g_spot * DT))
+        inc_c = float(np.sum(pic_val * g_contract_v * DT))
+        inc_s = float(np.sum(pis_val * g_spot_v * DT))
         inc_r = float(np.sum(pir_val * reserve_v * DT))
         inc_total = inc_c + inc_s + inc_r
 
@@ -336,27 +270,24 @@ def solve_bilevel(price_mwh, kappa, temp, alpha, beta,
 
         st_results.append({
             "station_id": i + 1,
-            "g_buy": g_buy, "p_fast": p_fast,
-            "g_contract": g_contract, "g_spot": g_spot, "reserve": reserve_v,
+            "g_buy": g_buy_v, "p_fast": p_fast_v, "p_slow_mean": p_slow_v,
+            "g_contract": g_contract_v, "g_spot": g_spot_v, "reserve": reserve_v,
             "ch": ch_v, "dis": dis_v, "e": e_v, "h": h_v,
             "h_elec": h_elec_v, "h_ch_grid": h_ch_grid_v, "q_heat": q_heat_v,
             "cs": cs_v, "ss": ss_v, "rs": rs_v,
-            "p_slow_mean": p_slow_mean, "p_slow_scenarios": p_slow_sc,
-            "scenario_probs": sc_pr,
             "alloc_contract": np.array([alloc_c[i][t].X for t in range(N)]),
             "alloc_spot": np.array([alloc_s[i][t].X for t in range(N)]),
             "alloc_reserve": np.array([alloc_r[i][t].X for t in range(N)]),
-            "contract_del": float(np.sum(g_contract) * DT),
-            "spot_del": float(np.sum(g_spot) * DT),
+            "contract_del": float(np.sum(g_contract_v) * DT),
+            "spot_del": float(np.sum(g_spot_v) * DT),
             "reserve_com": float(np.sum(reserve_v * mp.reserve_mask) * DT),
             "cs_kwh": cs_kwh, "ss_kwh": ss_kwh, "rs_kwh": rs_kwh,
             "buy_cost": buy_cost, "user_rev": user_rev, "tc": tc,
             "heat_offset": heat_offset,
             "heat_supply_kwh": float(np.sum(q_heat_v) * DT),
             "h_elec_cost": h_elec_cost, "h_ch_grid_cost": h_ch_grid_cost,
-            "fast_ratio": float(np.sum(p_fast) / max(np.sum(station_fast[i]), 1e-9)),
-            "slow_ratio": float(np.sum(sc_pr * np.sum(p_slow_sc, axis=1))
-                                / max(np.sum(sc_pr * np.sum(station_slow[i], axis=1)), 1e-9)),
+            "fast_ratio": float(np.sum(p_fast_v) / max(np.sum(station_fast[i]), 1e-9)),
+            "slow_ratio": float(np.sum(p_slow_v) / max(np.sum(slow_expected[i]), 1e-9)),
             "eta_c_t": sm["eta_c_t"], "eta_d_t": sm["eta_d_t"],
             "p_factor_t": sm["p_factor_t"],
             "incentive_rev_contract": inc_c,
